@@ -1,6 +1,6 @@
 {
   "name": "termhub",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "description": "The hub of termchat, keyrace and termdrop: your profile and friends, who's online where, shared settings, and installing, opening and updating the apps.",
   "repository": {
     "type": "git",
