@@ -107,3 +107,37 @@ describe('identity backup', () => {
     expect(code(() => collect({ ...paths.hub, identity: path.join(empty, 'identity.json') }, '1.0.0'))).toBe('invalid');
   });
 });
+
+describe('restore from termhub', () => {
+  it('only while no app runs; afterwards termhub starts again as the restored person', async () => {
+    const { Stores } = await import('./helpers.js');
+    const { startInstanceServer } = await import('termcore/app/instance');
+    const stores = new Stores();
+    try {
+      const { paths: alicePaths } = aliceWithFriends();
+      const file = path.join(tmpDir('bk'), 'alice.thb');
+      exportBackup(alicePaths.hub, file, PASS, '1.0.0', LOG_N);
+
+      const bobPaths = profile('Bob');
+      const bob = stores.make(bobPaths);
+      // Bob's termchat is open
+      const lockDir = path.join(bobPaths.hub.dir, 'termchat');
+      fs.mkdirSync(lockDir, { recursive: true });
+      const sock = path.join(lockDir, 'termchat.sock');
+      const server = await startInstanceServer(sock);
+      fs.writeFileSync(path.join(lockDir, 'termchat.lock'), JSON.stringify({ pid: process.pid, startedAt: Date.now(), socket: sock }));
+      await expect(bob.importBackup(file, PASS)).rejects.toThrow('Quit termchat first');
+      server.close();
+      fs.rmSync(path.join(lockDir, 'termchat.lock'));
+
+      await expect(bob.importBackup(file, 'not the passphrase')).rejects.toThrow('Wrong passphrase');
+      const r = await bob.importBackup(file, PASS);
+      expect(r.summary.name).toBe('Alice');
+      const again = stores.make(bobPaths);
+      expect(again.profile.name).toBe('Alice');
+      expect(again.identity.id).toBe(new Hub(alicePaths.hub).identity.id);
+    } finally {
+      await stores.stopAll();
+    }
+  });
+});

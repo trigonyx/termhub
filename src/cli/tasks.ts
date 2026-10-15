@@ -102,7 +102,8 @@ export async function updateAll(paths: Paths): Promise<number> {
     }
   }
   out(`\n━━━ termhub ━━━\n`);
-  const selfCode = await updateSelf();
+  // a source checkout doesn't update itself – that's no failure of the others
+  const selfCode = self.installKind() === 'source' ? (out(`${plain(self.SOURCE_HINT)}\n`), 0) : await updateSelf();
   if (!any) out('All apps are up to date.\n');
   return failed || selfCode ? 1 : 0;
 }

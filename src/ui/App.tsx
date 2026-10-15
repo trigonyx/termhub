@@ -138,7 +138,10 @@ export function Root({ paths, options, session, notice }: { paths: Paths; option
 }
 
 type Overlay = { kind: 'panel'; title: string; text: string } | null;
-type Bottom = { kind: 'dialog'; spec: DialogSpec } | { kind: 'secret'; title: string; hint?: string; resolve(v: string | null): void } | null;
+/** `seq` gives every request its own component (a second prompt never starts with the first one's text). */
+type Bottom = ({ kind: 'dialog'; spec: DialogSpec } | { kind: 'secret'; title: string; hint?: string; resolve(v: string | null): void }) & { seq: number } | null;
+
+let bottomSeq = 0;
 
 export function Main({
   store,
@@ -199,6 +202,7 @@ export function Main({
       new Promise<T>((resolve) =>
         setBottom({
           kind: 'dialog',
+          seq: ++bottomSeq,
           spec: make((v) => {
             setBottom(null);
             resolve(v);
@@ -215,6 +219,7 @@ export function Main({
         new Promise<string | null>((resolve) =>
           setBottom({
             kind: 'secret',
+            seq: ++bottomSeq,
             title,
             hint,
             resolve: (v) => {
@@ -306,9 +311,9 @@ export function Main({
   const footer = (hints: string[]): ReactNode => (
     <>
       {bottom?.kind === 'dialog' ? (
-        <Dialog spec={bottom.spec} width={width} />
+        <Dialog key={bottom.seq} spec={bottom.spec} width={width} />
       ) : bottom?.kind === 'secret' ? (
-        <SecretPrompt title={bottom.title} hint={bottom.hint} width={width} onDone={bottom.resolve} />
+        <SecretPrompt key={bottom.seq} title={bottom.title} hint={bottom.hint} width={width} onDone={bottom.resolve} />
       ) : commandMode ? (
         <>
           <InputBox state={editor} onChange={setEditor} onSubmit={cmd.submit} onKey={cmd.onKey} isActive width={width} history={history} borderColor={theme.accent} singleLine />
