@@ -1,0 +1,32 @@
+{
+  "v": 1,
+  "apps": [
+    {
+      "id": "termchat",
+      "name": "termchat",
+      "description": "End-to-end encrypted chat with friends on your network",
+      "repo": "trigonyx/termchat",
+      "bin": "termchat",
+      "node": 22,
+      "icon": "◆"
+    },
+    {
+      "id": "keyrace",
+      "name": "keyrace",
+      "description": "Typing races against your friends",
+      "repo": "trigonyx/keyrace",
+      "bin": "keyrace",
+      "node": 22,
+      "icon": "▸"
+    },
+    {
+      "id": "termdrop",
+      "name": "termdrop",
+      "description": "Encrypted file sharing with friends on your network",
+      "repo": "trigonyx/termdrop",
+      "bin": "termdrop",
+      "node": 22,
+      "icon": "↧"
+    }
+  ]
+}
