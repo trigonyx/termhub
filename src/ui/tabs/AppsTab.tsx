@@ -80,7 +80,8 @@ export function AppsTab({ store, width, height: full, actions, active, selectedK
           store.restart();
           return actions.quit();
         }
-        if (key.escape || key.return || input === 'q') store.dismissTask();
+        // (q stays "quit", like everywhere)
+        if (key.escape || key.return) store.dismissTask();
         return;
       }
       if (key.upArrow || input === 'k') return move(-1);
