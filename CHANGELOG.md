@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.0 – 2026-10-17
+
+- Badges in the Apps tab: unread termchat messages, keyrace invites and termdrop offers per app; notices from every app show up here, also while an app is open
+
 ## 1.0.0 – 2026-10-15
 
 - termhub skeleton: one hub on termcore, onboarding with a profile color, tabs, Friends tab with presence in every app

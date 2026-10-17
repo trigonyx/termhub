@@ -495,6 +495,82 @@ function parseLinksFile(raw) {
   const links = (v) => Array.isArray(v) ? v.map(parseLink).filter((l) => l !== null) : [];
   return { v: 1, mine: links(o.mine), known: links(o.known) };
 }
+var MAX_NOTICES = 200;
+var MAX_NOTICE_TTL = 7 * 24 * 36e5;
+var MAX_NOTICE_MSG = 2e4;
+var NOTICE_ID_RE = /^[A-Za-z0-9:._-]{1,80}$/;
+var NOTICE_KIND_RE = /^[a-z_]{1,16}$/;
+var MAX_NOTICE_TITLE = 80;
+var MAX_NOTICE_BODY = 300;
+var oneLine = (v, max2) => typeof v === "string" ? sanitizeText(v).replace(/\s+/g, " ").trim().slice(0, max2) : "";
+function parseNotice(raw, now = Date.now()) {
+  const o = raw;
+  if (!o || typeof o !== "object") return null;
+  if (typeof o.id !== "string" || !NOTICE_ID_RE.test(o.id) || !isSuiteApp(o.app)) return null;
+  if (typeof o.kind !== "string" || !NOTICE_KIND_RE.test(o.kind)) return null;
+  const until = num(o.until);
+  if (until === void 0 || until <= now) return null;
+  let msg;
+  if (o.msg !== void 0) {
+    if (!o.msg || typeof o.msg !== "object" || Array.isArray(o.msg) || JSON.stringify(o.msg).length > MAX_NOTICE_MSG) return null;
+    msg = o.msg;
+  }
+  return compact({
+    id: o.id,
+    app: o.app,
+    kind: o.kind,
+    title: oneLine(o.title, MAX_NOTICE_TITLE) || "Unknown",
+    body: oneLine(o.body, MAX_NOTICE_BODY),
+    msg,
+    ts: num(o.ts) ?? now,
+    until: Math.min(until, now + MAX_NOTICE_TTL)
+  });
+}
+function newestNotices(list, key) {
+  const seen = /* @__PURE__ */ new Set();
+  const out2 = [];
+  for (const n of list) {
+    if (!n || seen.has(key(n))) continue;
+    seen.add(key(n));
+    out2.push(n);
+  }
+  return out2.sort((a, b) => a.ts - b.ts).slice(-MAX_NOTICES);
+}
+function parseInbox(raw, now = Date.now()) {
+  const o = raw ?? {};
+  const list = Array.isArray(o.notices) ? o.notices : [];
+  const notices = newestNotices(
+    list.map((r) => {
+      const n = parseNotice(r, now);
+      const from = r?.from;
+      if (!n || typeof from !== "string" || !PEER_ID_RE.test(from)) return null;
+      return { ...n, from, ...r.local === true ? { local: true } : {} };
+    }),
+    (n) => `${n.from}/${n.id}`
+  );
+  const waiting = {};
+  if (o.waiting && typeof o.waiting === "object" && !Array.isArray(o.waiting)) {
+    for (const [k, w] of Object.entries(o.waiting)) {
+      const n = num(w?.n);
+      if (!isSuiteApp(k) || n === void 0 || n < 0) continue;
+      waiting[k] = { n: Math.floor(n), ...w.live === true ? { live: true } : {} };
+    }
+  }
+  return { v: 1, notices, waiting };
+}
+function parseOutbox(raw, now = Date.now()) {
+  const list = raw?.notices;
+  const notices = newestNotices(
+    (Array.isArray(list) ? list : []).map((r) => {
+      const n = parseNotice(r, now);
+      const o = r;
+      if (!n || typeof o.to !== "string" || !PEER_ID_RE.test(o.to)) return null;
+      return { ...n, to: o.to, ...o.sent === true ? { sent: true } : {}, ...o.withdrawn === true ? { withdrawn: true } : {} };
+    }),
+    (n) => `${n.to}/${n.id}`
+  );
+  return { v: 1, notices };
+}
 
 // ../termcore/src/store/migrate.ts
 import crypto3 from "crypto";
@@ -951,6 +1027,8 @@ var Hub = class {
     this.peers = new SharedFile(paths.peers, { locksDir, parse: parsePeersFile });
     this.settings = new SharedFile(paths.settings, { locksDir, parse: parseSettings });
     this.links = new SharedFile(paths.links, { locksDir, parse: parseLinksFile });
+    this.inbox = new SharedFile(paths.inbox, { locksDir, parse: (raw) => parseInbox(raw) });
+    this.outbox = new SharedFile(paths.outbox, { locksDir, parse: (raw) => parseOutbox(raw) });
   }
   identity;
   profile;
@@ -958,6 +1036,10 @@ var Hub = class {
   peers;
   settings;
   links;
+  /** notices friends sent for my apps, and what each app has waiting (termhub's badges) */
+  inbox;
+  /** notices my apps send to friends whose app isn't open */
+  outbox;
   /**
    * Run once at startup, before anything reads the hub: migrates the apps' old data on the
    * first start of a new version (see migrate.ts).
@@ -992,7 +1074,7 @@ var Hub = class {
     }
   }
   files() {
-    return [this.profile, this.friends, this.peers, this.settings, this.links];
+    return [this.profile, this.friends, this.peers, this.settings, this.links, this.inbox, this.outbox];
   }
   get me() {
     return this.profile.get();
@@ -1298,6 +1380,8 @@ function hubPaths(dir, legacy) {
     peers: path8.join(dir, "peers.json"),
     settings: path8.join(dir, "settings.json"),
     links: path8.join(dir, "links.json"),
+    inbox: path8.join(dir, "inbox.json"),
+    outbox: path8.join(dir, "outbox.json"),
     migration: path8.join(dir, "migration.json"),
     runDir: path8.join(dir, "run"),
     legacyDir: path8.join(dir, "legacy"),
@@ -1604,7 +1688,7 @@ var apps_default = {
 // package.json
 var package_default = {
   name: "termhub",
-  version: "1.0.0",
+  version: "1.1.0",
   description: "The hub of termchat, keyrace and termdrop: your profile and friends, who's online where, shared settings, and installing, opening and updating the apps.",
   repository: {
     type: "git",
@@ -2513,6 +2597,8 @@ var icons = {
   pointer: "\u276F",
   online: "\u25CF",
   offline: "\u25CB",
+  /** online, but in another app of the suite */
+  elsewhere: "\u25CC",
   away: "\u25D0",
   busy: "\u25D1",
   dnd: "\u2298",
@@ -3250,17 +3336,33 @@ import fs11 from "fs";
 import path14 from "path";
 function registerRun(runDir, info) {
   const file = path14.join(runDir, `${info.app}.json`);
-  const entry = { ...info, pid: process.pid, startedAt: Date.now() };
-  try {
-    writeJsonAtomic(file, entry);
-  } catch {
-    return () => {
-    };
-  }
-  return () => {
+  let entry = { ...info, pid: process.pid, startedAt: Date.now() };
+  const write = () => {
     try {
-      if (readJson(file, null)?.pid === process.pid) fs11.rmSync(file, { force: true });
+      writeJsonAtomic(file, entry);
+      return true;
     } catch {
+      return false;
+    }
+  };
+  if (!write()) return { update: () => {
+  }, remove: () => {
+  } };
+  let removed = false;
+  return {
+    update(status) {
+      if (removed) return;
+      const next = { ...entry, ...status };
+      if (JSON.stringify(next) === JSON.stringify(entry)) return;
+      entry = next;
+      write();
+    },
+    remove() {
+      removed = true;
+      try {
+        if (readJson(file, null)?.pid === process.pid) fs11.rmSync(file, { force: true });
+      } catch {
+      }
     }
   };
 }
@@ -3477,496 +3579,12 @@ var PeerBook = class {
   }
 };
 
-// ../termcore/src/friends/net.ts
-import fs12 from "fs";
-
-// ../termcore/src/app/notify.ts
-import { execFile as execFile3 } from "child_process";
-var MAC_SCRIPT = "on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run";
-function notify(title, body, app = "termhub") {
-  const cmd = process.platform === "darwin" ? ["osascript", ["-e", MAC_SCRIPT, title, body]] : process.platform === "linux" ? ["notify-send", [`--app-name=${app}`, "--", title, body]] : null;
-  if (!cmd) return;
-  try {
-    execFile3(cmd[0], [...cmd[1]], () => {
-    }).on("error", () => {
-    });
-  } catch {
-  }
-}
-
-// ../termcore/src/net/dialer.ts
-var MAX_BACKOFF = 3e4;
-var MAX_BACKOFF_NEARBY = 5e3;
-var CALLBACK_TTL = 15e3;
-var MAX_CALLBACKS_PER_MINUTE = 10;
-var Dialer = class {
-  constructor(d) {
-    this.d = d;
-  }
-  states = /* @__PURE__ */ new Map();
-  /** Peers that asked us to connect to them (id → when). */
-  callbacks = /* @__PURE__ */ new Map();
-  callbackTimes = [];
-  /** Friends we already told that they can't be reached. */
-  warned = /* @__PURE__ */ new Set();
-  /** We dialed this id and someone else answered – that session waits for their link. */
-  relinking = /* @__PURE__ */ new Map();
-  timer = null;
-  start(intervalMs = 1500) {
-    this.timer = setInterval(() => this.loop(), intervalMs);
-    this.timer.unref();
-    this.loop();
-  }
-  stop() {
-    if (this.timer) clearInterval(this.timer);
-  }
-  /** A session came up: forget backoff and callbacks for that peer. */
-  connected(id) {
-    this.states.delete(id);
-    this.callbacks.delete(id);
-    this.warned.delete(id);
-    this.relinking.delete(id);
-  }
-  /** A connection turned out to be useless (e.g. someone else answered): back off as after a failed dial. */
-  failed(id) {
-    const ds = this.states.get(id) ?? { inFlight: false, next: 0, backoff: 1e3 };
-    ds.backoff = Math.min(ds.backoff * 2, MAX_BACKOFF);
-    ds.next = Date.now() + ds.backoff;
-    this.states.set(id, ds);
-  }
-  /** Discovery saw peers (maybe at a new address) – retry them right away. */
-  discovered(ids) {
-    for (const id of ids) {
-      const ds = this.states.get(id);
-      if (ds && !ds.inFlight) ds.next = 0;
-    }
-  }
-  wanted(id) {
-    const state = this.d.stateOf(id);
-    return state === "accepted" || state === "outgoing" || state !== "blocked" && (this.d.alsoWants?.(id) ?? false);
-  }
-  wantsConnection(id) {
-    return !this.d.network.isOnline(id) && this.wanted(id);
-  }
-  /** Dials, and asks the peer to dial us too – whichever direction the firewalls allow wins. */
-  connect(id) {
-    this.tryDial(id);
-    this.d.discovery()?.callMe(id);
-  }
-  /** A peer asked us to connect to them, e.g. because they sent us a request but can't reach us. */
-  onCallback(id) {
-    if (this.d.network.isOnline(id) || this.d.stateOf(id) === "blocked") return;
-    const now = Date.now();
-    if (!this.callbacks.has(id)) {
-      this.callbackTimes = this.callbackTimes.filter((t) => now - t < 6e4);
-      if (this.callbackTimes.length >= MAX_CALLBACKS_PER_MINUTE) return;
-      this.callbackTimes.push(now);
-    }
-    this.callbacks.set(id, now);
-    this.tryDial(id);
-  }
-  loop() {
-    for (const id of this.d.candidates()) this.tryDial(id);
-    const now = Date.now();
-    for (const [id, at] of this.callbacks) {
-      if (now - at >= CALLBACK_TTL) this.callbacks.delete(id);
-      else this.tryDial(id);
-    }
-  }
-  target(id) {
-    const p = this.d.discovery()?.find(id);
-    const port = p && (this.d.portOf ? this.d.portOf(p) : p.port);
-    if (p && port) return { ip: p.ip, port, discovered: true };
-    const last = this.d.lastAddress(id);
-    return last ? { ...last, discovered: false } : null;
-  }
-  tryDial(id) {
-    const { network } = this.d;
-    if (network.isOnline(id) || this.relinking.get(id)?.isOpen) return;
-    const state = this.d.stateOf(id);
-    const now = Date.now();
-    const calledBack = state !== "blocked" && now - (this.callbacks.get(id) ?? -Infinity) < CALLBACK_TTL;
-    if (!this.wanted(id) && !calledBack) return;
-    const t = this.target(id);
-    if (!t) return;
-    const ds = this.states.get(id) ?? { inFlight: false, next: 0, backoff: 1e3 };
-    this.states.set(id, ds);
-    if (ds.inFlight || now < ds.next) return;
-    if (t.discovered && !calledBack && state !== "outgoing" && this.d.myId > id) {
-      ds.deferredSince ??= now;
-      if (now - ds.deferredSince < 4e3) return;
-    }
-    ds.inFlight = true;
-    network.dial(t.ip, t.port, id).then((s) => {
-      this.states.delete(id);
-      if (s.peerId !== id) this.relinking.set(id, s);
-    }).catch((err2) => {
-      this.d.log(`Connection to ${id} (${t.ip}:${t.port}) failed: ${err2.message}`);
-      ds.backoff = Math.min(ds.backoff * 2, t.discovered ? MAX_BACKOFF_NEARBY : MAX_BACKOFF);
-      ds.next = Date.now() + ds.backoff;
-      ds.failures = (ds.failures ?? 0) + 1;
-      const s = this.d.stateOf(id);
-      const waiting = s === "outgoing" || s === "accepted";
-      if (waiting && t.discovered && ds.failures >= 3 && !network.isOnline(id) && !this.warned.has(id)) {
-        this.warned.add(id);
-        this.d.unreachable(id, { ip: t.ip, port: t.port, error: err2.message });
-      }
-    }).finally(() => {
-      ds.inFlight = false;
-    });
-  }
-};
-
-// ../termcore/src/net/discovery.ts
-import dgram from "dgram";
-import os5 from "os";
-import { EventEmitter as EventEmitter3 } from "events";
-var ANNOUNCE_INTERVAL = 3e3;
-var EXPIRE_AFTER = 1e4;
-var IPV4_RE2 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
-var MAX_PACKET = 2048;
-var HINT_INTERVAL = 15e3;
-var REPROBE_AFTER = 3e4;
-var MAX_GOSSIP = 32;
-var MAX_WAS = 4;
-var SCAN_BATCH = 5;
-var SCAN_TICK = 50;
-var MIN_SCAN_PREFIX = 16;
-var RESCAN_ALONE = 10 * 6e4;
-function localIPv4s() {
-  const out2 = [];
-  for (const addrs of Object.values(os5.networkInterfaces())) {
-    for (const a of addrs ?? []) {
-      if (a.family !== "IPv4" || a.internal) continue;
-      const ip = a.address.split(".").map(Number);
-      const mask = a.netmask.split(".").map(Number);
-      const broadcast = ip.map((b, i) => (b | ~mask[i] & 255) & 255).join(".");
-      out2.push({ address: a.address, netmask: a.netmask, broadcast });
-    }
-  }
-  return out2;
-}
-var toInt = (ip) => ip.split(".").reduce((n, b) => n * 256 + Number(b), 0);
-var toIp = (n) => [n >>> 24, n >>> 16 & 255, n >>> 8 & 255, n & 255].join(".");
-function prefixLength(netmask) {
-  let n = toInt(netmask);
-  let bits = 0;
-  while (n & 2147483648) {
-    bits++;
-    n = n << 1 >>> 0;
-  }
-  return bits;
-}
-function isPrivate(ip) {
-  const [a, b] = ip.split(".").map(Number);
-  return a === 10 || a === 172 && b >= 16 && b < 32 || a === 192 && b === 168 || a === 100 && b >= 64 && b < 128;
-}
-function* scanOrder(ifaces) {
-  const ranges = ifaces.flatMap((i) => {
-    const prefix = prefixLength(i.netmask);
-    if (prefix > 30 || i.address.startsWith("169.254.")) return [];
-    const mask = prefix < MIN_SCAN_PREFIX ? 4294901760 : toInt(i.netmask);
-    const ip = toInt(i.address);
-    const net3 = (ip & mask) >>> 0;
-    const broadcast = (net3 | ~mask >>> 0) >>> 0;
-    return [{ ip, net: net3, broadcast }];
-  });
-  const gens = ranges.map(function* ({ ip, net: net3, broadcast }) {
-    for (let d = 1; ip + d < broadcast || ip - d > net3; d++) {
-      if (ip + d < broadcast) yield toIp(ip + d);
-      if (ip - d > net3) yield toIp(ip - d);
-    }
-  });
-  const seen = /* @__PURE__ */ new Set();
-  while (gens.length) {
-    for (let i = 0; i < gens.length; i++) {
-      const r = gens[i].next();
-      if (r.done) gens.splice(i--, 1);
-      else if (!seen.has(r.value)) {
-        seen.add(r.value);
-        yield r.value;
-      }
-    }
-  }
-}
-function udpTransport(port) {
-  return ({ onMessage, onError, onReady }) => {
-    const socket = dgram.createSocket({ type: "udp4", reuseAddr: true });
-    let bound = false;
-    socket.on("error", (err2) => {
-      if (!bound) onError(err2);
-    });
-    socket.on("message", (buf, rinfo) => onMessage(buf, rinfo.address));
-    socket.bind(port, () => {
-      bound = true;
-      try {
-        socket.setBroadcast(true);
-      } catch {
-      }
-      onReady();
-    });
-    return {
-      send(buf, address, to = port) {
-        try {
-          socket.send(buf, to, address, () => {
-          });
-        } catch {
-        }
-      },
-      close() {
-        try {
-          socket.close();
-        } catch {
-        }
-      }
-    };
-  };
-}
-function parseApps2(v) {
-  if (!v || typeof v !== "object" || Array.isArray(v)) return void 0;
-  const out2 = {};
-  for (const [k, p] of Object.entries(v)) {
-    if (isSuiteApp(k) && Number.isInteger(p) && p > 0 && p < 65536) out2[k] = p;
-  }
-  return Object.keys(out2).length ? out2 : void 0;
-}
-function parseWas(v, own) {
-  if (!Array.isArray(v)) return void 0;
-  const out2 = v.slice(0, MAX_WAS).filter((x) => typeof x === "string" && PEER_ID_RE.test(x) && x !== own);
-  return out2.length ? out2 : void 0;
-}
-var sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-var Discovery = class extends EventEmitter3 {
-  constructor(myId, getName, getPort, opts) {
-    super();
-    this.myId = myId;
-    this.getName = getName;
-    this.getPort = getPort;
-    this.opts = opts;
-    this.listApps = new Set(opts.listApps ?? [opts.app]);
-    this.udpPort = opts.udpPort ?? SUITE[opts.app].udpPort;
-  }
-  transport = null;
-  timer = null;
-  scanTimer = null;
-  scanQueue = null;
-  lastScanEnd = 0;
-  lastHints = 0;
-  netSignature = "";
-  /** address → when we last asked it directly */
-  probed = /* @__PURE__ */ new Map();
-  peers = /* @__PURE__ */ new Map();
-  listApps;
-  udpPort;
-  /** True while the own subnet is being scanned. */
-  get scanning() {
-    return this.scanQueue !== null;
-  }
-  start() {
-    const open = this.opts.transport ?? udpTransport(this.udpPort);
-    this.transport = open({
-      onMessage: (buf, address) => this.onMessage(buf, address),
-      onError: (err2) => {
-        this.emit("log", `Discovery unavailable: ${err2.message}`);
-        this.stop();
-      },
-      onReady: () => {
-        this.netSignature = this.signature();
-        this.announce(true);
-        this.probeHints();
-        this.startScan();
-        this.timer = setInterval(() => this.tick(), ANNOUNCE_INTERVAL);
-        this.timer.unref();
-      }
-    });
-  }
-  /** The peer that is (or used to be, see `was`) `id`. */
-  find(id) {
-    const direct = this.peers.get(id);
-    if (direct) return direct;
-    for (const p of this.peers.values()) if (p.was?.includes(id)) return p;
-    return void 0;
-  }
-  /** Re-announce immediately, e.g. after a name change. */
-  announce(query) {
-    const msg = this.message(query);
-    for (const target of /* @__PURE__ */ new Set(["255.255.255.255", ...this.interfaces().map((i) => i.broadcast)])) this.sendTo(msg, target);
-    for (const p of this.peers.values()) {
-      const m = p.app === this.opts.app ? msg : { ...msg, q: 1 };
-      this.sendTo(this.opts.wants?.(p.id) ? { ...m, c: 1 } : m, p.ip, p.app);
-    }
-  }
-  /** Asks a peer right away to connect to us (e.g. after sending them a request). */
-  callMe(id) {
-    const p = this.find(id);
-    if (p) this.sendTo({ ...this.message(false), c: 1 }, p.ip, p.app);
-  }
-  tick() {
-    const now = Date.now();
-    const signature = this.signature();
-    if (signature !== this.netSignature) {
-      this.netSignature = signature;
-      this.emit("log", "Network changed \u2013 searching again");
-      this.probed.clear();
-      this.announce(true);
-      this.probeHints();
-      this.startScan();
-    } else {
-      this.announce(false);
-      if (now - this.lastHints >= HINT_INTERVAL) this.probeHints();
-      if (!this.scanQueue && this.peers.size === 0 && now - this.lastScanEnd >= RESCAN_ALONE) this.startScan();
-    }
-    for (const [ip, at] of this.probed) if (now - at >= REPROBE_AFTER) this.probed.delete(ip);
-    this.expire();
-  }
-  message(query) {
-    const msg = { app: this.opts.app, v: 1, id: this.myId, name: this.getName(), port: this.getPort() };
-    if (query) msg.q = 1;
-    const ips = [...new Set([...this.peers.values()].map((p) => p.ip))].slice(0, MAX_GOSSIP);
-    if (ips.length) msg.ips = ips;
-    const apps = this.opts.apps?.();
-    if (apps && Object.keys(apps).length) msg.apps = apps;
-    const was = this.opts.was?.().slice(0, MAX_WAS);
-    if (was?.length) msg.was = was;
-    return msg;
-  }
-  /**
-   * Sends to `address` on the port of `app` (default: ours). Queries to other apps' ports ask
-   * for the answer on ours (`rp`).
-   */
-  sendTo(msg, address, app = this.opts.app, port) {
-    const to = port ?? (app === this.opts.app ? this.udpPort : SUITE[app].udpPort);
-    const out2 = to === this.udpPort ? msg : { ...msg, rp: this.udpPort };
-    this.transport?.send(Buffer.from(JSON.stringify(out2)), address, to);
-  }
-  /** Sends a query to `address` on our port and on every port in `alsoAsk`. */
-  query(address) {
-    const msg = this.message(true);
-    this.sendTo(msg, address);
-    for (const other of this.opts.alsoAsk ?? []) this.sendTo(msg, address, other.app, other.udpPort);
-  }
-  interfaces() {
-    return this.opts.interfaces?.() ?? localIPv4s();
-  }
-  signature() {
-    return this.interfaces().map((i) => `${i.address}/${i.netmask}`).sort().join(",");
-  }
-  /** Asks one address directly whether the app runs there (at most every 30 s). */
-  probe(ip) {
-    if (!IPV4_RE2.test(ip) || this.interfaces().some((i) => i.address === ip)) return;
-    for (const p of this.peers.values()) if (p.ip === ip) return;
-    const last = this.probed.get(ip);
-    if (last !== void 0 && Date.now() - last < REPROBE_AFTER) return;
-    this.probed.set(ip, Date.now());
-    this.query(ip);
-  }
-  probeHints() {
-    this.lastHints = Date.now();
-    for (const ip of this.opts.hints?.() ?? []) this.probe(ip);
-    if (this.opts.alsoAsk?.length) {
-      const msg = this.message(true);
-      for (const target of /* @__PURE__ */ new Set(["255.255.255.255", ...this.interfaces().map((i) => i.broadcast)])) {
-        for (const other of this.opts.alsoAsk) this.sendTo(msg, target, other.app, other.udpPort);
-      }
-    }
-  }
-  startScan() {
-    this.scanQueue = scanOrder(this.interfaces());
-    if (!this.scanTimer) {
-      this.scanTimer = setInterval(() => this.scanStep(), SCAN_TICK);
-      this.scanTimer.unref();
-    }
-    this.emit("change");
-  }
-  scanStep() {
-    const known = new Set([...this.peers.values()].map((p) => p.ip));
-    for (let sent = 0; sent < SCAN_BATCH; ) {
-      const next = this.scanQueue?.next();
-      if (!next || next.done) {
-        this.scanQueue = null;
-        this.lastScanEnd = Date.now();
-        if (this.scanTimer) clearInterval(this.scanTimer);
-        this.scanTimer = null;
-        this.emit("change");
-        return;
-      }
-      if (known.has(next.value)) continue;
-      this.query(next.value);
-      sent++;
-    }
-  }
-  onMessage(buf, address) {
-    if (buf.length > MAX_PACKET) return;
-    let msg;
-    try {
-      msg = JSON.parse(buf.toString("utf8"));
-    } catch {
-      return;
-    }
-    if (!msg || !isSuiteApp(msg.app) || msg.v !== 1 || typeof msg.id !== "string" || !PEER_ID_RE.test(msg.id)) return;
-    if (msg.id === this.myId) return;
-    const port = Number(msg.port);
-    if (!Number.isInteger(port) || port <= 0 || port > 65535) return;
-    const rp = Number.isInteger(msg.rp) && msg.rp >= 1024 && msg.rp <= 65535 ? msg.rp : void 0;
-    if (!this.listApps.has(msg.app)) {
-      if (msg.q && rp) this.sendTo(this.message(false), address, this.opts.app, rp);
-      return;
-    }
-    const prev = this.peers.get(msg.id);
-    const apps = parseApps2(msg.apps);
-    const was = parseWas(msg.was, msg.id);
-    const peer = {
-      id: msg.id,
-      name: cleanName(msg.name),
-      ip: address,
-      port,
-      lastSeen: Date.now(),
-      app: msg.app,
-      ...apps ? { apps } : {},
-      ...was ? { was } : {}
-    };
-    this.peers.set(msg.id, peer);
-    if (!prev || prev.ip !== peer.ip || prev.port !== peer.port || prev.name !== peer.name || prev.app !== peer.app || !sameJson(prev.apps, peer.apps) || !sameJson(prev.was, peer.was)) {
-      this.emit("change");
-    }
-    if (msg.q) this.sendTo(this.message(false), address, msg.app, rp);
-    if (msg.c === 1) this.emit("callback", msg.id);
-    if (Array.isArray(msg.ips)) {
-      const subnets = this.interfaces().map((i) => ({ net: toInt(i.address) & toInt(i.netmask), mask: toInt(i.netmask) }));
-      const nearby = (ip) => isPrivate(ip) || subnets.some((s) => (toInt(ip) & s.mask) === s.net);
-      for (const ip of msg.ips.slice(0, MAX_GOSSIP)) {
-        if (typeof ip === "string" && IPV4_RE2.test(ip) && nearby(ip)) this.probe(ip);
-      }
-    }
-  }
-  expire() {
-    const now = Date.now();
-    let changed = false;
-    for (const [id, p] of this.peers) {
-      if (now - p.lastSeen > EXPIRE_AFTER) {
-        this.peers.delete(id);
-        changed = true;
-      }
-    }
-    if (changed) this.emit("change");
-  }
-  stop() {
-    if (this.timer) clearInterval(this.timer);
-    if (this.scanTimer) clearInterval(this.scanTimer);
-    this.timer = null;
-    this.scanTimer = null;
-    this.scanQueue = null;
-    this.transport?.close();
-    this.transport = null;
-  }
-};
-
 // ../termcore/src/net/network.ts
 import net2 from "net";
-import { EventEmitter as EventEmitter6 } from "events";
+import { EventEmitter as EventEmitter5 } from "events";
 
 // ../termcore/src/net/framing.ts
-import { EventEmitter as EventEmitter4 } from "events";
+import { EventEmitter as EventEmitter3 } from "events";
 var MAX_FRAME = 64 * 1024;
 var FrameTooLargeError = class extends Error {
   constructor(size) {
@@ -3994,7 +3612,7 @@ var FrameDecoder = class {
     return frames;
   }
 };
-var FrameSocket = class extends EventEmitter4 {
+var FrameSocket = class extends EventEmitter3 {
   constructor(socket) {
     super();
     this.socket = socket;
@@ -4265,12 +3883,12 @@ async function performHandshake(fs15, opts) {
 }
 
 // ../termcore/src/net/peer.ts
-import { EventEmitter as EventEmitter5 } from "events";
+import { EventEmitter as EventEmitter4 } from "events";
 var PING_INTERVAL = 15e3;
 var IDLE_TIMEOUT = 45e3;
 var RATE_WINDOW = 1e3;
 var RATE_MAX = 200;
-var Session = class extends EventEmitter5 {
+var Session = class extends EventEmitter4 {
   constructor(fs15, hs, initiator, parse, tag, expected) {
     super();
     this.fs = fs15;
@@ -4373,7 +3991,7 @@ var Session = class extends EventEmitter5 {
 // ../termcore/src/net/network.ts
 var MAX_PENDING_HANDSHAKES = 32;
 var DIAL_TIMEOUT = 4e3;
-var Network = class extends EventEmitter6 {
+var Network = class extends EventEmitter5 {
   constructor(opts) {
     super();
     this.opts = opts;
@@ -4530,6 +4148,11 @@ var Network = class extends EventEmitter6 {
 };
 
 // ../termcore/src/friends/wire.ts
+var MAX_NOTICE_IDS = 100;
+function noticeIds(v) {
+  if (!Array.isArray(v) || v.length > MAX_NOTICE_IDS) return null;
+  return v.filter((x) => typeof x === "string" && x.length <= 80);
+}
 var NO_EXTENSION = { parse: () => null };
 function parseJsonObject(buf) {
   let o;
@@ -4572,6 +4195,18 @@ function parseWire(buf, ext = NO_EXTENSION) {
       const links = o.links.map(parseLink).filter((l) => l !== null);
       return { t: "links", links };
     }
+    case "notice": {
+      const n = parseNotice(o);
+      return n ? { t: "notice", ...n } : null;
+    }
+    case "unnotice": {
+      const ids = noticeIds(o.ids);
+      return ids ? { t: "unnotice", ids } : null;
+    }
+    case "noticed": {
+      const ids = noticeIds(o.ids);
+      return ids ? { t: "noticed", ids, ...o.gone === true ? { gone: true } : {} } : null;
+    }
     case "decline":
     case "ping":
     case "pong":
@@ -4580,6 +4215,849 @@ function parseWire(buf, ext = NO_EXTENSION) {
     default:
       return ext.parse(o);
   }
+}
+
+// ../termcore/src/friends/courier.ts
+var WAIT_MS = 1500;
+async function travel(t) {
+  const network = new Network({
+    protocol: t.protocol,
+    me: t.me,
+    getName: () => t.name,
+    parse: (plain2) => parseWire(plain2)
+  });
+  let session = null;
+  try {
+    session = await network.dial(t.ip, t.port, t.peerId ?? void 0);
+    const s = session;
+    if (t.peerId && s.peerId !== t.peerId) throw new Error("Someone else is now reachable at this address");
+    const answer = new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(null), t.waitMs ?? WAIT_MS);
+      timer.unref();
+      s.on("message", (m) => {
+        if (!t.answer(m)) return;
+        clearTimeout(timer);
+        resolve(m);
+      });
+      s.on("close", () => {
+        clearTimeout(timer);
+        resolve(null);
+      });
+    });
+    if (t.links.length) s.send({ t: "links", links: t.links });
+    for (const m of t.send) s.send(m);
+    return {
+      peerId: s.peerId,
+      peerName: s.peerName,
+      publicKey: s.peerPublicRaw.toString("base64url"),
+      remoteAddress: s.remoteAddress,
+      answer: await answer
+    };
+  } finally {
+    session?.close("Delivered", true);
+    await network.stop();
+  }
+}
+async function deliver(d) {
+  const msg = d.send.t === "state" ? { t: "state", name: d.name, state: d.send.state, port: 0, ...d.color ? { color: d.color } : {} } : { t: "decline" };
+  const { answer, ...r } = await travel({ ...d, send: [msg], answer: (m) => m.t === "state" });
+  const their = answer?.t === "state" ? answer : null;
+  return { ...r, theirState: their?.state ?? null, ...their?.color ? { color: their.color } : {} };
+}
+
+// ../termcore/src/friends/net.ts
+import fs12 from "fs";
+
+// ../termcore/src/app/notify.ts
+import { execFile as execFile3 } from "child_process";
+var MAC_SCRIPT = "on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run";
+function notify(title, body, app = "termhub") {
+  const cmd = process.platform === "darwin" ? ["osascript", ["-e", MAC_SCRIPT, title, body]] : process.platform === "linux" ? ["notify-send", [`--app-name=${app}`, "--", title, body]] : null;
+  if (!cmd) return;
+  try {
+    execFile3(cmd[0], [...cmd[1]], () => {
+    }).on("error", () => {
+    });
+  } catch {
+  }
+}
+
+// ../termcore/src/net/dialer.ts
+var MAX_BACKOFF = 3e4;
+var MAX_BACKOFF_NEARBY = 5e3;
+var CALLBACK_TTL = 15e3;
+var MAX_CALLBACKS_PER_MINUTE = 10;
+var Dialer = class {
+  constructor(d) {
+    this.d = d;
+  }
+  states = /* @__PURE__ */ new Map();
+  /** Peers that asked us to connect to them (id → when). */
+  callbacks = /* @__PURE__ */ new Map();
+  callbackTimes = [];
+  /** Friends we already told that they can't be reached. */
+  warned = /* @__PURE__ */ new Set();
+  /** We dialed this id and someone else answered – that session waits for their link. */
+  relinking = /* @__PURE__ */ new Map();
+  timer = null;
+  start(intervalMs = 1500) {
+    this.timer = setInterval(() => this.loop(), intervalMs);
+    this.timer.unref();
+    this.loop();
+  }
+  stop() {
+    if (this.timer) clearInterval(this.timer);
+  }
+  /** A session came up: forget backoff and callbacks for that peer. */
+  connected(id) {
+    this.states.delete(id);
+    this.callbacks.delete(id);
+    this.warned.delete(id);
+    this.relinking.delete(id);
+  }
+  /** A connection turned out to be useless (e.g. someone else answered): back off as after a failed dial. */
+  failed(id) {
+    const ds = this.states.get(id) ?? { inFlight: false, next: 0, backoff: 1e3 };
+    ds.backoff = Math.min(ds.backoff * 2, MAX_BACKOFF);
+    ds.next = Date.now() + ds.backoff;
+    this.states.set(id, ds);
+  }
+  /** Discovery saw peers (maybe at a new address) – retry them right away. */
+  discovered(ids) {
+    for (const id of ids) {
+      const ds = this.states.get(id);
+      if (ds && !ds.inFlight) ds.next = 0;
+    }
+  }
+  wanted(id) {
+    const state = this.d.stateOf(id);
+    return state === "accepted" || state === "outgoing" || state !== "blocked" && (this.d.alsoWants?.(id) ?? false);
+  }
+  wantsConnection(id) {
+    return !this.d.network.isOnline(id) && this.wanted(id);
+  }
+  /** Dials, and asks the peer to dial us too – whichever direction the firewalls allow wins. */
+  connect(id) {
+    this.tryDial(id);
+    this.d.discovery()?.callMe(id);
+  }
+  /** A peer asked us to connect to them, e.g. because they sent us a request but can't reach us. */
+  onCallback(id) {
+    if (this.d.network.isOnline(id) || this.d.stateOf(id) === "blocked") return;
+    const now = Date.now();
+    if (!this.callbacks.has(id)) {
+      this.callbackTimes = this.callbackTimes.filter((t) => now - t < 6e4);
+      if (this.callbackTimes.length >= MAX_CALLBACKS_PER_MINUTE) return;
+      this.callbackTimes.push(now);
+    }
+    this.callbacks.set(id, now);
+    this.tryDial(id);
+  }
+  loop() {
+    for (const id of this.d.candidates()) this.tryDial(id);
+    const now = Date.now();
+    for (const [id, at] of this.callbacks) {
+      if (now - at >= CALLBACK_TTL) this.callbacks.delete(id);
+      else this.tryDial(id);
+    }
+  }
+  target(id) {
+    const p = this.d.discovery()?.find(id);
+    const port = p && (this.d.portOf ? this.d.portOf(p) : p.port);
+    if (p && port) return { ip: p.ip, port, discovered: true };
+    const last = this.d.lastAddress(id);
+    return last ? { ...last, discovered: false } : null;
+  }
+  tryDial(id) {
+    const { network } = this.d;
+    if (network.isOnline(id) || this.relinking.get(id)?.isOpen) return;
+    const state = this.d.stateOf(id);
+    const now = Date.now();
+    const calledBack = state !== "blocked" && now - (this.callbacks.get(id) ?? -Infinity) < CALLBACK_TTL;
+    if (!this.wanted(id) && !calledBack) return;
+    const t = this.target(id);
+    if (!t) return;
+    const ds = this.states.get(id) ?? { inFlight: false, next: 0, backoff: 1e3 };
+    this.states.set(id, ds);
+    if (ds.inFlight || now < ds.next) return;
+    if (t.discovered && !calledBack && state !== "outgoing" && this.d.myId > id) {
+      ds.deferredSince ??= now;
+      if (now - ds.deferredSince < 4e3) return;
+    }
+    ds.inFlight = true;
+    network.dial(t.ip, t.port, id).then((s) => {
+      this.states.delete(id);
+      if (s.peerId !== id) this.relinking.set(id, s);
+    }).catch((err2) => {
+      this.d.log(`Connection to ${id} (${t.ip}:${t.port}) failed: ${err2.message}`);
+      ds.backoff = Math.min(ds.backoff * 2, t.discovered ? MAX_BACKOFF_NEARBY : MAX_BACKOFF);
+      ds.next = Date.now() + ds.backoff;
+      ds.failures = (ds.failures ?? 0) + 1;
+      const s = this.d.stateOf(id);
+      const waiting = s === "outgoing" || s === "accepted";
+      if (waiting && t.discovered && ds.failures >= 3 && !network.isOnline(id) && !this.warned.has(id)) {
+        this.warned.add(id);
+        this.d.unreachable(id, { ip: t.ip, port: t.port, error: err2.message });
+      }
+    }).finally(() => {
+      ds.inFlight = false;
+    });
+  }
+};
+
+// ../termcore/src/net/discovery.ts
+import dgram from "dgram";
+import os5 from "os";
+import { EventEmitter as EventEmitter6 } from "events";
+var ANNOUNCE_INTERVAL = 3e3;
+var EXPIRE_AFTER = 1e4;
+var IPV4_RE2 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+var MAX_PACKET = 2048;
+var HINT_INTERVAL = 15e3;
+var REPROBE_AFTER = 3e4;
+var MAX_GOSSIP = 32;
+var MAX_WAS = 4;
+var SCAN_BATCH = 5;
+var SCAN_TICK = 50;
+var MIN_SCAN_PREFIX = 16;
+var RESCAN_ALONE = 10 * 6e4;
+function localIPv4s() {
+  const out2 = [];
+  for (const addrs of Object.values(os5.networkInterfaces())) {
+    for (const a of addrs ?? []) {
+      if (a.family !== "IPv4" || a.internal) continue;
+      const ip = a.address.split(".").map(Number);
+      const mask = a.netmask.split(".").map(Number);
+      const broadcast = ip.map((b, i) => (b | ~mask[i] & 255) & 255).join(".");
+      out2.push({ address: a.address, netmask: a.netmask, broadcast });
+    }
+  }
+  return out2;
+}
+var toInt = (ip) => ip.split(".").reduce((n, b) => n * 256 + Number(b), 0);
+var toIp = (n) => [n >>> 24, n >>> 16 & 255, n >>> 8 & 255, n & 255].join(".");
+function prefixLength(netmask) {
+  let n = toInt(netmask);
+  let bits = 0;
+  while (n & 2147483648) {
+    bits++;
+    n = n << 1 >>> 0;
+  }
+  return bits;
+}
+function isPrivate(ip) {
+  const [a, b] = ip.split(".").map(Number);
+  return a === 10 || a === 172 && b >= 16 && b < 32 || a === 192 && b === 168 || a === 100 && b >= 64 && b < 128;
+}
+function* scanOrder(ifaces) {
+  const ranges = ifaces.flatMap((i) => {
+    const prefix = prefixLength(i.netmask);
+    if (prefix > 30 || i.address.startsWith("169.254.")) return [];
+    const mask = prefix < MIN_SCAN_PREFIX ? 4294901760 : toInt(i.netmask);
+    const ip = toInt(i.address);
+    const net3 = (ip & mask) >>> 0;
+    const broadcast = (net3 | ~mask >>> 0) >>> 0;
+    return [{ ip, net: net3, broadcast }];
+  });
+  const gens = ranges.map(function* ({ ip, net: net3, broadcast }) {
+    for (let d = 1; ip + d < broadcast || ip - d > net3; d++) {
+      if (ip + d < broadcast) yield toIp(ip + d);
+      if (ip - d > net3) yield toIp(ip - d);
+    }
+  });
+  const seen = /* @__PURE__ */ new Set();
+  while (gens.length) {
+    for (let i = 0; i < gens.length; i++) {
+      const r = gens[i].next();
+      if (r.done) gens.splice(i--, 1);
+      else if (!seen.has(r.value)) {
+        seen.add(r.value);
+        yield r.value;
+      }
+    }
+  }
+}
+function udpTransport(port) {
+  return ({ onMessage, onError, onReady }) => {
+    const socket = dgram.createSocket({ type: "udp4", reuseAddr: true });
+    let bound = false;
+    socket.on("error", (err2) => {
+      if (!bound) onError(err2);
+    });
+    socket.on("message", (buf, rinfo) => onMessage(buf, rinfo.address));
+    socket.bind(port, () => {
+      bound = true;
+      try {
+        socket.setBroadcast(true);
+      } catch {
+      }
+      onReady();
+    });
+    return {
+      send(buf, address, to = port) {
+        try {
+          socket.send(buf, to, address, () => {
+          });
+        } catch {
+        }
+      },
+      close() {
+        try {
+          socket.close();
+        } catch {
+        }
+      }
+    };
+  };
+}
+function parseApps2(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return void 0;
+  const out2 = {};
+  for (const [k, p] of Object.entries(v)) {
+    if (isSuiteApp(k) && Number.isInteger(p) && p > 0 && p < 65536) out2[k] = p;
+  }
+  return Object.keys(out2).length ? out2 : void 0;
+}
+function parseWas(v, own) {
+  if (!Array.isArray(v)) return void 0;
+  const out2 = v.slice(0, MAX_WAS).filter((x) => typeof x === "string" && PEER_ID_RE.test(x) && x !== own);
+  return out2.length ? out2 : void 0;
+}
+var sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+var Discovery = class extends EventEmitter6 {
+  constructor(myId, getName, getPort, opts) {
+    super();
+    this.myId = myId;
+    this.getName = getName;
+    this.getPort = getPort;
+    this.opts = opts;
+    this.listApps = new Set(opts.listApps ?? [opts.app]);
+    this.udpPort = opts.udpPort ?? SUITE[opts.app].udpPort;
+  }
+  transport = null;
+  timer = null;
+  scanTimer = null;
+  scanQueue = null;
+  lastScanEnd = 0;
+  lastHints = 0;
+  netSignature = "";
+  /** address → when we last asked it directly */
+  probed = /* @__PURE__ */ new Map();
+  peers = /* @__PURE__ */ new Map();
+  listApps;
+  udpPort;
+  /** True while the own subnet is being scanned. */
+  get scanning() {
+    return this.scanQueue !== null;
+  }
+  start() {
+    const open = this.opts.transport ?? udpTransport(this.udpPort);
+    this.transport = open({
+      onMessage: (buf, address) => this.onMessage(buf, address),
+      onError: (err2) => {
+        this.emit("log", `Discovery unavailable: ${err2.message}`);
+        this.stop();
+      },
+      onReady: () => {
+        this.netSignature = this.signature();
+        this.announce(true);
+        this.probeHints();
+        this.startScan();
+        this.timer = setInterval(() => this.tick(), ANNOUNCE_INTERVAL);
+        this.timer.unref();
+      }
+    });
+  }
+  /** The peer that is (or used to be, see `was`) `id`. */
+  find(id) {
+    const direct = this.peers.get(id);
+    if (direct) return direct;
+    for (const p of this.peers.values()) if (p.was?.includes(id)) return p;
+    return void 0;
+  }
+  /** Re-announce immediately, e.g. after a name change. */
+  announce(query) {
+    const msg = this.message(query);
+    for (const target of /* @__PURE__ */ new Set(["255.255.255.255", ...this.interfaces().map((i) => i.broadcast)])) this.sendTo(msg, target);
+    for (const p of this.peers.values()) {
+      const m = p.app === this.opts.app ? msg : { ...msg, q: 1 };
+      this.sendTo(this.opts.wants?.(p.id) ? { ...m, c: 1 } : m, p.ip, p.app);
+    }
+  }
+  /** Asks a peer right away to connect to us (e.g. after sending them a request). */
+  callMe(id) {
+    const p = this.find(id);
+    if (p) this.sendTo({ ...this.message(false), c: 1 }, p.ip, p.app);
+  }
+  tick() {
+    const now = Date.now();
+    const signature = this.signature();
+    if (signature !== this.netSignature) {
+      this.netSignature = signature;
+      this.emit("log", "Network changed \u2013 searching again");
+      this.probed.clear();
+      this.announce(true);
+      this.probeHints();
+      this.startScan();
+    } else {
+      this.announce(false);
+      if (now - this.lastHints >= HINT_INTERVAL) this.probeHints();
+      if (!this.scanQueue && this.peers.size === 0 && now - this.lastScanEnd >= RESCAN_ALONE) this.startScan();
+    }
+    for (const [ip, at] of this.probed) if (now - at >= REPROBE_AFTER) this.probed.delete(ip);
+    this.expire();
+  }
+  message(query) {
+    const msg = { app: this.opts.app, v: 1, id: this.myId, name: this.getName(), port: this.getPort() };
+    if (query) msg.q = 1;
+    const ips = [...new Set([...this.peers.values()].map((p) => p.ip))].slice(0, MAX_GOSSIP);
+    if (ips.length) msg.ips = ips;
+    const apps = this.opts.apps?.();
+    if (apps && Object.keys(apps).length) msg.apps = apps;
+    const was = this.opts.was?.().slice(0, MAX_WAS);
+    if (was?.length) msg.was = was;
+    return msg;
+  }
+  /**
+   * Sends to `address` on the port of `app` (default: ours). Queries to other apps' ports ask
+   * for the answer on ours (`rp`).
+   */
+  sendTo(msg, address, app = this.opts.app, port) {
+    const to = port ?? (app === this.opts.app ? this.udpPort : SUITE[app].udpPort);
+    const out2 = to === this.udpPort ? msg : { ...msg, rp: this.udpPort };
+    this.transport?.send(Buffer.from(JSON.stringify(out2)), address, to);
+  }
+  /** Sends a query to `address` on our port and on every port in `alsoAsk`. */
+  query(address) {
+    const msg = this.message(true);
+    this.sendTo(msg, address);
+    for (const other of this.opts.alsoAsk ?? []) this.sendTo(msg, address, other.app, other.udpPort);
+  }
+  interfaces() {
+    return this.opts.interfaces?.() ?? localIPv4s();
+  }
+  signature() {
+    return this.interfaces().map((i) => `${i.address}/${i.netmask}`).sort().join(",");
+  }
+  /** Asks one address directly whether the app runs there (at most every 30 s). */
+  probe(ip) {
+    if (!IPV4_RE2.test(ip) || this.interfaces().some((i) => i.address === ip)) return;
+    for (const p of this.peers.values()) if (p.ip === ip) return;
+    const last = this.probed.get(ip);
+    if (last !== void 0 && Date.now() - last < REPROBE_AFTER) return;
+    this.probed.set(ip, Date.now());
+    this.query(ip);
+  }
+  probeHints() {
+    this.lastHints = Date.now();
+    for (const ip of this.opts.hints?.() ?? []) this.probe(ip);
+    if (this.opts.alsoAsk?.length) {
+      const msg = this.message(true);
+      for (const target of /* @__PURE__ */ new Set(["255.255.255.255", ...this.interfaces().map((i) => i.broadcast)])) {
+        for (const other of this.opts.alsoAsk) this.sendTo(msg, target, other.app, other.udpPort);
+      }
+    }
+  }
+  startScan() {
+    this.scanQueue = scanOrder(this.interfaces());
+    if (!this.scanTimer) {
+      this.scanTimer = setInterval(() => this.scanStep(), SCAN_TICK);
+      this.scanTimer.unref();
+    }
+    this.emit("change");
+  }
+  scanStep() {
+    const known = new Set([...this.peers.values()].map((p) => p.ip));
+    for (let sent = 0; sent < SCAN_BATCH; ) {
+      const next = this.scanQueue?.next();
+      if (!next || next.done) {
+        this.scanQueue = null;
+        this.lastScanEnd = Date.now();
+        if (this.scanTimer) clearInterval(this.scanTimer);
+        this.scanTimer = null;
+        this.emit("change");
+        return;
+      }
+      if (known.has(next.value)) continue;
+      this.query(next.value);
+      sent++;
+    }
+  }
+  onMessage(buf, address) {
+    if (buf.length > MAX_PACKET) return;
+    let msg;
+    try {
+      msg = JSON.parse(buf.toString("utf8"));
+    } catch {
+      return;
+    }
+    if (!msg || !isSuiteApp(msg.app) || msg.v !== 1 || typeof msg.id !== "string" || !PEER_ID_RE.test(msg.id)) return;
+    if (msg.id === this.myId) return;
+    const port = Number(msg.port);
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) return;
+    const rp = Number.isInteger(msg.rp) && msg.rp >= 1024 && msg.rp <= 65535 ? msg.rp : void 0;
+    if (!this.listApps.has(msg.app)) {
+      if (msg.q && rp) this.sendTo(this.message(false), address, this.opts.app, rp);
+      return;
+    }
+    const prev = this.peers.get(msg.id);
+    const apps = parseApps2(msg.apps);
+    const was = parseWas(msg.was, msg.id);
+    const peer = {
+      id: msg.id,
+      name: cleanName(msg.name),
+      ip: address,
+      port,
+      lastSeen: Date.now(),
+      app: msg.app,
+      ...apps ? { apps } : {},
+      ...was ? { was } : {}
+    };
+    this.peers.set(msg.id, peer);
+    if (!prev || prev.ip !== peer.ip || prev.port !== peer.port || prev.name !== peer.name || prev.app !== peer.app || !sameJson(prev.apps, peer.apps) || !sameJson(prev.was, peer.was)) {
+      this.emit("change");
+    }
+    if (msg.q) this.sendTo(this.message(false), address, msg.app, rp);
+    if (msg.c === 1) this.emit("callback", msg.id);
+    if (Array.isArray(msg.ips)) {
+      const subnets = this.interfaces().map((i) => ({ net: toInt(i.address) & toInt(i.netmask), mask: toInt(i.netmask) }));
+      const nearby = (ip) => isPrivate(ip) || subnets.some((s) => (toInt(ip) & s.mask) === s.net);
+      for (const ip of msg.ips.slice(0, MAX_GOSSIP)) {
+        if (typeof ip === "string" && IPV4_RE2.test(ip) && nearby(ip)) this.probe(ip);
+      }
+    }
+  }
+  expire() {
+    const now = Date.now();
+    let changed = false;
+    for (const [id, p] of this.peers) {
+      if (now - p.lastSeen > EXPIRE_AFTER) {
+        this.peers.delete(id);
+        changed = true;
+      }
+    }
+    if (changed) this.emit("change");
+  }
+  stop() {
+    if (this.timer) clearInterval(this.timer);
+    if (this.scanTimer) clearInterval(this.scanTimer);
+    this.timer = null;
+    this.scanTimer = null;
+    this.scanQueue = null;
+    this.transport?.close();
+    this.transport = null;
+  }
+};
+
+// ../termcore/src/friends/notices.ts
+import crypto8 from "crypto";
+var COURIER_GRACE = 1500;
+var COURIER_RETRY = 2e4;
+var COURIER_MAX_RETRY = 10 * 6e4;
+var TICK_MS = 2e3;
+var LOCAL_TTL = 2 * 6e4;
+var RUN_CACHE_MS = 500;
+var APP_ORDER = ["termhub", "termchat", "keyrace", "termdrop"];
+var keyOf = (who, id) => `${who}/${id}`;
+function badgeOf(inbox, app, running) {
+  const notices = inbox.notices.filter((n) => n.app === app && !n.local).length;
+  const w = inbox.waiting[app];
+  return notices + (w && (!w.live || running) ? w.n : 0);
+}
+var NoticeCenter = class {
+  constructor(d) {
+    this.d = d;
+    d.hub.inbox.on("change", () => this.onInbox());
+    d.hub.outbox.on("change", () => this.flush());
+  }
+  timer = null;
+  /** inbox entries we already know (no toast for them) */
+  known = /* @__PURE__ */ new Set();
+  /** outbox entries on their way: the session they went out on, and whether it was the withdrawal */
+  inflight = /* @__PURE__ */ new Map();
+  courierBusy = /* @__PURE__ */ new Set();
+  courierNext = /* @__PURE__ */ new Map();
+  runCache = null;
+  seenSig = "";
+  started = false;
+  get own() {
+    return this.d.app.name;
+  }
+  start() {
+    this.started = true;
+    for (const n of this.d.hub.inbox.get().notices) this.known.add(keyOf(n.from, n.id));
+    this.takeOwn();
+    this.timer = setInterval(() => this.tick(), TICK_MS);
+    this.timer.unref();
+    this.flush();
+  }
+  stop() {
+    this.started = false;
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+    if (this.d.hub.inbox.get().waiting[this.own]?.live) this.setWaiting(0, true);
+  }
+  // ───────────── Sending ─────────────
+  /** A notice for one of `to`'s other apps. Returns its id. */
+  send(to, n) {
+    const now = Date.now();
+    const id = n.id ?? crypto8.randomUUID();
+    const entry = {
+      id,
+      app: this.own,
+      kind: n.kind,
+      title: n.title,
+      body: n.body,
+      ...n.msg ? { msg: n.msg } : {},
+      ts: now,
+      until: now + n.ttlMs,
+      to
+    };
+    this.d.hub.outbox.update((o) => {
+      o.notices = [...o.notices.filter((x) => !(x.to === to && x.id === id)), entry];
+    });
+    this.courierNext.set(keyOf(to, id), { at: now + COURIER_GRACE, fails: 0 });
+    return id;
+  }
+  /**
+   * Takes a notice back: they're told to forget it. Always explicitly – it may be on its way
+   * through another app of mine right now, without a confirmation yet.
+   */
+  withdraw(id, to) {
+    if (!this.d.hub.outbox.get().notices.some((x) => x.id === id && (!to || x.to === to) && !x.withdrawn)) return;
+    this.d.hub.outbox.update((o) => {
+      o.notices = o.notices.map((x) => {
+        if (x.id !== id || to && x.to !== to) return x;
+        const { sent: _sent, ...rest } = x;
+        return { ...rest, withdrawn: true };
+      });
+    });
+  }
+  /** Forgets a notice without telling anyone (termchat: the message itself got through). */
+  drop(id, to) {
+    if (!this.d.hub.outbox.get().notices.some((x) => x.id === id && (!to || x.to === to))) return;
+    this.d.hub.outbox.update((o) => {
+      o.notices = o.notices.filter((x) => !(x.id === id && (!to || x.to === to)));
+    });
+  }
+  /** Notices on their way (or delivered and still withdrawable), e.g. to know who has one. */
+  outgoing() {
+    return this.d.hub.outbox.get().notices;
+  }
+  /** A short-lived note for my other apps: this app got something itself (never counted). */
+  note(from, n) {
+    const now = Date.now();
+    const entry = { id: n.id ?? crypto8.randomUUID(), app: this.own, kind: n.kind, title: n.title, body: n.body, ts: now, until: now + LOCAL_TTL, from, local: true };
+    this.known.add(keyOf(from, entry.id));
+    this.d.hub.inbox.update((box) => {
+      box.notices = [...box.notices.filter((x) => !(x.from === from && x.id === entry.id)), entry];
+    });
+  }
+  /** What this app has waiting for you (termhub's badge). `live`: only while it runs. */
+  setWaiting(n, live = false) {
+    const want = n > 0 ? { n, ...live ? { live: true } : {} } : void 0;
+    if (JSON.stringify(this.d.hub.inbox.get().waiting[this.own]) === JSON.stringify(want)) return;
+    try {
+      this.d.hub.inbox.update((box) => {
+        if (want) box.waiting[this.own] = want;
+        else delete box.waiting[this.own];
+      });
+    } catch (err2) {
+      this.d.log(`Couldn't write the inbox: ${err2.message}`);
+    }
+  }
+  // ───────────── My apps ─────────────
+  /** The other suite apps running on this computer. */
+  others() {
+    const now = Date.now();
+    if (!this.runCache || now - this.runCache.at > RUN_CACHE_MS) {
+      this.runCache = { at: now, list: runningApps2(this.d.hub.paths.runDir).filter((r) => r.app !== this.own || r.pid !== process.pid) };
+    }
+    return this.runCache.list;
+  }
+  isRunning(app) {
+    return app === this.own || this.others().some((r) => r.app === app);
+  }
+  /** The apps of `id` that my other apps see online right now. */
+  elsewhere(id) {
+    const apps = /* @__PURE__ */ new Set();
+    for (const r of this.others()) for (const a of r.seen?.[id] ?? []) if (a in SUITE) apps.add(a);
+    apps.delete(this.own);
+    return APP_ORDER.filter((a) => apps.has(a));
+  }
+  /** Another app of mine is connected to them (it passes notices on). */
+  relayed(id) {
+    return this.others().some((r) => r.sessions?.includes(id));
+  }
+  // ───────────── Delivery ─────────────
+  due() {
+    const now = Date.now();
+    return this.d.hub.outbox.get().notices.filter((n) => n.until > now && (!n.sent || n.withdrawn));
+  }
+  wireOf(n) {
+    if (n.withdrawn) return { t: "unnotice", ids: [n.id] };
+    const { to: _to, sent: _sent, withdrawn: _w, ...notice } = n;
+    return { t: "notice", ...notice };
+  }
+  /** Passes due notices on over our own sessions. */
+  flush() {
+    if (!this.started) return;
+    for (const n of this.due()) {
+      if (n.app === this.own && !n.withdrawn) continue;
+      const s = this.d.network.get(n.to);
+      const key = keyOf(n.to, n.id);
+      const gone = !!n.withdrawn;
+      const busy = this.inflight.get(key);
+      if (!s?.isOpen || !this.d.isFriend(n.to) || busy?.s === s && busy.gone === gone) continue;
+      if (s.send(this.wireOf(n))) this.inflight.set(key, { s, gone });
+    }
+  }
+  onSession() {
+    this.flush();
+  }
+  onOffline(id) {
+    for (const k of [...this.inflight.keys()]) if (k.startsWith(`${id}/`)) this.inflight.delete(k);
+  }
+  /** They confirmed notices (`gone`: withdrawals). */
+  confirmed(from, ids, gone) {
+    for (const id of ids) if (this.inflight.get(keyOf(from, id))?.gone === gone) this.inflight.delete(keyOf(from, id));
+    const set = new Set(ids);
+    const hit = (n) => n.to === from && set.has(n.id) && !!n.withdrawn === gone;
+    if (!this.d.hub.outbox.get().notices.some(hit)) return;
+    this.d.hub.outbox.update((o) => {
+      o.notices = o.notices.flatMap((n) => {
+        if (!hit(n)) return [n];
+        return gone ? [] : [{ ...n, sent: true }];
+      });
+    });
+  }
+  tick() {
+    this.flush();
+    this.courierRound();
+    const sig = JSON.stringify(this.others().map((r) => [r.app, r.seen ?? {}]));
+    if (sig !== this.seenSig) {
+      this.seenSig = sig;
+      this.d.changed();
+    }
+  }
+  /** Notices nobody could pass on: deliver them in a short session in an app of theirs. */
+  courierRound() {
+    const now = Date.now();
+    for (const n of this.due()) {
+      if (n.app !== this.own && !(this.own === "termhub" && !this.isRunning(n.app))) continue;
+      if (this.courierBusy.has(n.to) || this.d.network.get(n.to)?.isOpen || this.relayed(n.to)) continue;
+      const key = keyOf(n.to, n.id);
+      const next = this.courierNext.get(key) ?? { at: 0, fails: 0 };
+      if (now < next.at) continue;
+      const targets = this.d.targets(n.to).filter((t) => !this.isRunning(t.app));
+      if (!targets.length) continue;
+      void this.carry(n, targets, next.fails);
+    }
+  }
+  async carry(n, targets, fails) {
+    const key = keyOf(n.to, n.id);
+    this.courierBusy.add(n.to);
+    try {
+      for (const t of targets) {
+        try {
+          const r = await travel({
+            protocol: `${t.app}/1`,
+            ip: t.ip,
+            port: t.port,
+            peerId: n.to,
+            me: this.d.identity,
+            name: this.d.name(),
+            links: this.d.links(),
+            send: [this.wireOf(n)],
+            answer: (m) => m.t === "noticed" && m.ids.includes(n.id) && !!m.gone === !!n.withdrawn,
+            waitMs: this.d.courierWaitMs
+          });
+          if (r.answer) {
+            this.d.log(`Notice ${n.id} for ${n.to} delivered through ${t.app}`);
+            this.courierNext.delete(key);
+            this.confirmed(n.to, [n.id], !!n.withdrawn);
+            return;
+          }
+        } catch (err2) {
+          this.d.log(`Couldn't deliver notice ${n.id} to ${n.to} through ${t.app} (${t.ip}:${t.port}): ${err2.message}`);
+        }
+      }
+      this.courierNext.set(key, { at: Date.now() + Math.min(COURIER_RETRY * 2 ** fails, COURIER_MAX_RETRY), fails: fails + 1 });
+    } finally {
+      this.courierBusy.delete(n.to);
+    }
+  }
+  // ───────────── Receiving ─────────────
+  /** `notice`, `unnotice` and `noticed` from a session. */
+  onWire(s, m) {
+    const from = s.peerId;
+    if (m.t === "noticed") return this.confirmed(from, m.ids, m.gone === true);
+    if (!this.d.isFriend(from)) return;
+    if (m.t === "unnotice") {
+      const set = new Set(m.ids);
+      if (this.d.hub.inbox.get().notices.some((n) => n.from === from && set.has(n.id))) {
+        this.d.hub.inbox.update((box) => {
+          box.notices = box.notices.filter((n) => !(n.from === from && set.has(n.id)));
+        });
+      }
+      s.send({ t: "noticed", ids: m.ids, gone: true });
+      return;
+    }
+    const { t: _t, ...notice } = m;
+    const key = keyOf(from, notice.id);
+    let fresh = false;
+    if (!this.known.has(key)) {
+      this.d.hub.inbox.update((box) => {
+        if (box.notices.some((n) => n.from === from && n.id === notice.id)) return;
+        fresh = true;
+        box.notices = [...box.notices, { ...notice, from }];
+      });
+    }
+    s.send({ t: "noticed", ids: [notice.id] });
+    if (fresh) this.bannerFor({ ...notice, from });
+  }
+  /** A banner only when nobody shows it otherwise: the app it's about isn't open, and none of mine is in front. */
+  bannerFor(n) {
+    if (this.d.dnd() || this.isRunning(n.app)) return;
+    if (this.d.front() || this.others().some((r) => r.front)) return;
+    this.d.banner(`${n.app} \xB7 ${n.title}`, n.body);
+  }
+  onInbox() {
+    if (!this.started) return;
+    const box = this.d.hub.inbox.get();
+    const fresh = [];
+    const now = /* @__PURE__ */ new Set();
+    for (const n of box.notices) {
+      const key = keyOf(n.from, n.id);
+      now.add(key);
+      if (!this.known.has(key)) fresh.push(n);
+    }
+    this.known = now;
+    if (!this.d.dnd()) {
+      for (const n of fresh) if (n.app !== this.own) this.d.show?.(n);
+    }
+    this.takeOwn();
+  }
+  /** The notices about this app: it takes them. */
+  takeOwn() {
+    const take = this.d.take;
+    if (!take) return;
+    const mine = this.d.hub.inbox.get().notices.filter((n) => n.app === this.own && !n.local);
+    if (!mine.length) return;
+    const ids = new Set(mine.map((n) => keyOf(n.from, n.id)));
+    this.d.hub.inbox.update((box) => {
+      box.notices = box.notices.filter((n) => !ids.has(keyOf(n.from, n.id)));
+    });
+    try {
+      take(mine.filter((n) => this.d.isFriend(n.from)));
+    } catch (err2) {
+      this.d.log(`Couldn't take notices: ${err2.message}`);
+    }
+  }
+};
+function noticeLine(n) {
+  const chat = n.kind === "msg" || n.kind === "gmsg";
+  return `${n.app} \xB7 ${n.title}${n.body ? `${chat ? ":" : ""} ${n.body}` : ""}`;
 }
 
 // ../termcore/src/friends/net.ts
@@ -4623,6 +5101,24 @@ var FriendNet = class {
       unreachable: (id, info) => this.event({ kind: "unreachable", id, who: this.peerName(id), ...info }),
       portOf: (p) => this.ownPort(p)
     });
+    this.notices = new NoticeCenter({
+      app,
+      hub,
+      identity: this.identity,
+      network: this.network,
+      name: () => this.name,
+      links: () => hub.myLinks(),
+      isFriend: (id) => this.contacts.get(id)?.state === "accepted",
+      targets: (id) => this.courierTargets(id),
+      front: () => opts.hooks.front?.() ?? this.focused,
+      banner: (title, body) => this.banner(title, body),
+      dnd: () => this.dnd,
+      show: (n) => this.event({ kind: "notice", notice: n, who: n.local ? n.title : this.peerName(n.from) }),
+      take: opts.hooks.takeNotices ? (list) => opts.hooks.takeNotices(list) : void 0,
+      log: (l) => this.log(l),
+      changed: () => this.changed(),
+      courierWaitMs: opts.courierWaitMs
+    });
     this.network.on("session", (s) => this.onSession(s));
     this.network.on("purpose", (c2) => opts.hooks.purpose ? opts.hooks.purpose(c2) : c2.fs.destroy());
     this.network.on("offline", (id) => this.onOffline(id));
@@ -4652,7 +5148,9 @@ var FriendNet = class {
   focused = true;
   presenceMap = /* @__PURE__ */ new Map();
   lastStates;
-  unregisterRun = null;
+  notices;
+  runEntry = null;
+  runTimer = null;
   started = false;
   /** Sessions with peers we don't know yet: our state waits for their first message. */
   awaitingFirst = /* @__PURE__ */ new WeakSet();
@@ -4662,8 +5160,10 @@ var FriendNet = class {
     await this.network.start(opts.port ?? this.app.tcpPort);
     this.started = true;
     const udpPort = opts.discoveryPort ?? this.app.udpPort;
-    this.unregisterRun = registerRun(this.hub.paths.runDir, { app: this.app.name, port: this.network.port, udp: udpPort, version: this.app.version });
+    this.runEntry = registerRun(this.hub.paths.runDir, { app: this.app.name, port: this.network.port, udp: udpPort, version: this.app.version });
+    this.writeRun();
     this.hub.watch();
+    this.notices.start();
     this.runRekey();
     if (opts.discovery !== false) {
       const d = new Discovery(this.identity.id, () => this.name, () => this.network.port, {
@@ -4686,12 +5186,15 @@ var FriendNet = class {
   }
   async stop() {
     this.started = false;
+    this.notices.stop();
+    if (this.runTimer) clearTimeout(this.runTimer);
+    this.runTimer = null;
     this.dialer.stop();
     this.discoveryRef?.stop();
     await this.network.stop();
     this.hub.close();
-    this.unregisterRun?.();
-    this.unregisterRun = null;
+    this.runEntry?.remove();
+    this.runEntry = null;
   }
   get discovery() {
     return this.discoveryRef;
@@ -4745,6 +5248,7 @@ var FriendNet = class {
   setFocused(focused) {
     if (this.focused === focused) return;
     this.focused = focused;
+    this.refreshRun();
     this.broadcastPresence();
     this.changed();
   }
@@ -4756,6 +5260,68 @@ var FriendNet = class {
     if (this.focused || !this.notificationsEnabled() || this.dnd) return;
     if (this.opts.notify) this.opts.notify(title, body);
     else notify(title, body, this.app.name);
+  }
+  /** Desktop banner regardless of focus (notices decide themselves who shows what). */
+  banner(title, body) {
+    if (!this.notificationsEnabled() || this.dnd) return;
+    if (this.opts.notify) this.opts.notify(title, body);
+    else notify(title, body, this.app.name);
+  }
+  // ───────────── Notices (see notices.ts) ─────────────
+  /** A notice for `to`'s other apps (they don't have this one open). Returns its id. */
+  sendNotice(to, n) {
+    return this.notices.send(to, n);
+  }
+  /** Takes a notice back (they're told if it reached them already). */
+  withdrawNotice(id, to) {
+    this.notices.withdraw(id, to);
+  }
+  /** Forgets a notice quietly (the real thing got through). */
+  dropNotice(id, to) {
+    this.notices.drop(id, to);
+  }
+  /** A short note for my other apps: something arrived here (they show it as a toast). */
+  noteLocally(from, n) {
+    try {
+      this.notices.note(from, n);
+    } catch (err2) {
+      this.log(`Couldn't write the inbox: ${err2.message}`);
+    }
+  }
+  /** What this app has waiting for you (termhub's badge). `live`: only counts while the app runs. */
+  setWaiting(n, live = false) {
+    this.notices.setWaiting(n, live);
+  }
+  /** The apps a friend has open that my other apps see (not this one). */
+  elsewhere(id) {
+    return this.contacts.get(id)?.state === "accepted" ? this.notices.elsewhere(id) : [];
+  }
+  /** Where a friend's apps listen right now (discovery), else where they did last time. */
+  courierTargets(id) {
+    const order = ["termhub", "termchat", "keyrace", "termdrop"];
+    const out2 = [];
+    const p = this.discovered(id);
+    const raw = this.contacts.raw(id);
+    const ip = p?.ip ?? raw?.lastIp;
+    if (!ip) return out2;
+    const ports = { ...raw?.ports, ...p ? { ...p.apps, [p.app]: p.port } : {} };
+    for (const app of this.notices.elsewhere(id)) ports[app] ??= SUITE[app].tcpPort;
+    for (const [app, port] of Object.entries(ports)) if (port && app !== this.app.name) out2.push({ app, ip, port });
+    return out2.sort((a, b) => order.indexOf(a.app) - order.indexOf(b.app));
+  }
+  /** Writes who we're connected to, who we see and whether we're in front into our run file (soon). */
+  refreshRun() {
+    if (!this.started || this.runTimer) return;
+    this.runTimer = setTimeout(() => {
+      this.runTimer = null;
+      this.writeRun();
+    }, 150);
+    this.runTimer.unref();
+  }
+  writeRun() {
+    const sessions = [...this.network.sessions.keys()].filter((id) => this.contacts.get(id)?.state === "accepted").sort();
+    const seen = this.opts.hooks.seen?.() ?? Object.fromEntries(sessions.map((id) => [id, [this.app.name]]));
+    this.runEntry?.update({ front: this.opts.hooks.front?.() ?? this.focused, sessions, seen });
   }
   // ───────────── Queries ─────────────
   isOnline(id) {
@@ -4956,6 +5522,7 @@ var FriendNet = class {
       }
     }
     this.dialer.discovered(seen);
+    if (this.opts.hooks.seen) this.refreshRun();
     this.changed();
   }
   onProfileChanged() {
@@ -5048,11 +5615,15 @@ var FriendNet = class {
     const own = this.ownPresence();
     if (Object.keys(own).length > 2 || own.away) this.sendPresence(id);
     this.opts.hooks.session?.(s);
+    this.notices.onSession();
+    this.refreshRun();
     this.log(`Connected to ${s.peerName} (${id}) via ${s.remoteAddress}`);
     this.changed();
   }
   onOffline(id) {
     this.presenceMap.delete(id);
+    this.notices.onOffline(id);
+    this.refreshRun();
     this.opts.hooks.offline?.(id);
     if (this.contacts.get(id)) this.contacts.upsert(id, { lastSeen: Date.now() });
     this.changed();
@@ -5102,6 +5673,10 @@ var FriendNet = class {
         this.changed();
         return;
       }
+      case "notice":
+      case "unnotice":
+      case "noticed":
+        return this.notices.onWire(s, base);
       case "ping":
       case "pong":
       case "bye":
@@ -5286,59 +5861,13 @@ var Seen = class {
   }
 };
 
-// src/core/courier.ts
-var WAIT_MS = 1500;
-async function deliver(d) {
-  const network = new Network({
-    protocol: d.protocol,
-    me: d.me,
-    getName: () => d.name,
-    parse: (plain2) => parseWire(plain2)
-  });
-  let session = null;
-  try {
-    session = await network.dial(d.ip, d.port, d.peerId ?? void 0);
-    const s = session;
-    if (d.peerId && s.peerId !== d.peerId) throw new Error("Someone else is now reachable at this address");
-    const answer = new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(null), d.waitMs ?? WAIT_MS);
-      timer.unref();
-      s.on("message", (m) => {
-        if (m.t === "state") {
-          clearTimeout(timer);
-          resolve({ state: m.state, ...m.color ? { color: m.color } : {} });
-        }
-      });
-      s.on("close", () => {
-        clearTimeout(timer);
-        resolve(null);
-      });
-    });
-    if (d.links.length) s.send({ t: "links", links: d.links });
-    if (d.send.t === "state") s.send({ t: "state", name: d.name, state: d.send.state, port: 0, ...d.color ? { color: d.color } : {} });
-    else s.send({ t: "decline" });
-    const their = await answer;
-    return {
-      peerId: s.peerId,
-      peerName: s.peerName,
-      publicKey: s.peerPublicRaw.toString("base64url"),
-      remoteAddress: s.remoteAddress,
-      theirState: their?.state ?? null,
-      ...their?.color ? { color: their.color } : {}
-    };
-  } finally {
-    session?.close("termhub delivered a change", true);
-    await network.stop();
-  }
-}
-
 // src/core/store.ts
-var APP_ORDER = ["termchat", "keyrace", "termdrop", "termhub"];
+var APP_ORDER2 = ["termchat", "keyrace", "termdrop", "termhub"];
 var OTHER_APPS = ["termchat", "keyrace", "termdrop"].map((app) => ({ app, udpPort: SUITE[app].udpPort }));
 var POLL_MS2 = 2500;
 var RETRY_MS = 6e4;
 var LOG_LINES = 400;
-var byApp = (a, b) => (APP_ORDER.indexOf(a) === -1 ? 99 : APP_ORDER.indexOf(a)) - (APP_ORDER.indexOf(b) === -1 ? 99 : APP_ORDER.indexOf(b)) || a.localeCompare(b);
+var byApp = (a, b) => (APP_ORDER2.indexOf(a) === -1 ? 99 : APP_ORDER2.indexOf(a)) - (APP_ORDER2.indexOf(b) === -1 ? 99 : APP_ORDER2.indexOf(b)) || a.localeCompare(b);
 function parseAppPorts(v) {
   if (!v || typeof v !== "object" || Array.isArray(v)) return void 0;
   const out2 = {};
@@ -5378,11 +5907,24 @@ var HubStore = class {
         },
         // which apps we have open: friends who connect to our termhub see it right away
         presenceExtra: () => ({ apps: runningPorts(this.paths.hub.runDir) }),
-        settings: (s) => this.applySettings(s)
+        settings: (s) => this.applySettings(s),
+        // an app opened from termhub is in front, not termhub (it shows notices then)
+        front: () => this.net.isFocused && !this.child,
+        // friends online anywhere: my apps can invite them or send them files through notices
+        seen: () => {
+          const out2 = {};
+          for (const c2 of this.contacts.all()) {
+            if (c2.state !== "accepted") continue;
+            const apps = this.appsOf(c2.id);
+            if (apps.length) out2[c2.id] = apps;
+          }
+          return out2;
+        }
       }
     });
     this.applySettings(this.hub.settings.get());
     setPersonColors((id) => this.contacts.get(id)?.color);
+    this.hub.inbox.on("change", () => this.changed());
   }
   net;
   hub;
@@ -5397,8 +5939,7 @@ var HubStore = class {
   apps = /* @__PURE__ */ new Map();
   self;
   task = null;
-  /** an app is open in this terminal right now (termhub is in the background) */
-  childRunning = false;
+  child = false;
   /** the app to open next (the UI quits Ink, cli.tsx runs it and comes back) */
   launch = null;
   globalRoot = null;
@@ -5412,6 +5953,19 @@ var HubStore = class {
   delivering = /* @__PURE__ */ new Set();
   wasOnline = /* @__PURE__ */ new Map();
   refreshing = null;
+  /** An app is open in this terminal right now (termhub is in the background). */
+  get childRunning() {
+    return this.child;
+  }
+  set childRunning(on) {
+    this.child = on;
+    this.net.refreshRun();
+  }
+  /** What an app has waiting for you: unread messages, invites, files – termhub's badge. */
+  badge(id) {
+    if (!isSuiteApp(id)) return 0;
+    return badgeOf(this.hub.inbox.get(), id, this.apps.get(id)?.running ?? false);
+  }
   static createProfile(paths, name, color) {
     return Hub.createProfile(paths.hub, name, color).id;
   }
@@ -5582,6 +6136,8 @@ var HubStore = class {
         return this.showToast(`${e.who} withdrew their friend request`);
       case "requestSent":
         return this.showToast(`Friend request sent to ${e.who} \u2013 waiting for them to accept`);
+      case "notice":
+        return this.showToast(noticeLine(e.notice));
       case "unreachable":
       case "linked":
         return;
@@ -7441,6 +7997,10 @@ function TaskPanel({ task, width, height }) {
 
 // src/ui/tabs/AppsTab.tsx
 import { jsx as jsx16, jsxs as jsxs16 } from "react/jsx-runtime";
+function waitingText(id, n) {
+  const [one, many] = id === "termchat" ? ["unread message", "unread messages"] : id === "keyrace" ? ["race invite", "race invites"] : id === "termdrop" ? ["file offer", "file offers"] : ["new thing", "new things"];
+  return `${n} ${n === 1 ? one : many}`;
+}
 var statusColor = (s) => s.kind === "update" ? theme.accent : s.kind === "current" ? theme.success : s.kind === "broken" ? theme.error : theme.faint;
 function appsHints(row, store) {
   const task = store.task;
@@ -7576,6 +8136,7 @@ function AppRow({ row, store, selected, width, gap }) {
     ] });
   }
   const e = row.e;
+  const badge = store.badge(e.app.id);
   const checking = e.detected === void 0;
   const label = checking ? "checking \u2026" : statusLabel(e.status);
   const statusWidth = Math.min(22, Math.max(12, label.length + 1));
@@ -7595,7 +8156,8 @@ function AppRow({ row, store, selected, width, gap }) {
         " "
       ] }) : null,
       width >= 70 ? /* @__PURE__ */ jsx16(Text16, { color: theme.dim, children: e.app.description }) : null
-    ] }) })
+    ] }) }),
+    /* @__PURE__ */ jsx16(Box15, { width: 5, flexShrink: 0, justifyContent: "flex-end", children: badge > 0 ? /* @__PURE__ */ jsx16(Text16, { backgroundColor: theme.accent, color: theme.onAccent, bold: true, children: ` ${badge > 99 ? "99+" : badge} ` }) : null })
   ] });
 }
 function Detail2({ store, row, width, height }) {
@@ -7622,6 +8184,7 @@ function Detail2({ store, row, width, height }) {
   const main2 = d?.state === "installed" ? d.main : null;
   const where = main2 ? main2.kind === "global" ? "npm's global folder" : main2.kind === "local" ? tildify(main2.where.replace(/[/\\]node_modules[/\\][^/\\]+$/, "")) : tildify(main2.where) : "\u2013";
   const node = e.app.node ? `Node.js ${e.app.node}+` : "any";
+  const badge = store.badge(e.app.id);
   return /* @__PURE__ */ jsxs16(Card, { title: `${e.app.icon ? `${e.app.icon} ` : ""}${e.app.name}`, width, height, children: [
     /* @__PURE__ */ jsx16(Text16, { color: theme.dim, wrap: "wrap", children: e.app.description || " " }),
     /* @__PURE__ */ jsx16(Text16, { children: " " }),
@@ -7630,6 +8193,7 @@ function Detail2({ store, row, width, height }) {
     /* @__PURE__ */ jsx16(Field, { label: "Where", children: where }),
     /* @__PURE__ */ jsx16(Field, { label: "Needs", children: node }),
     /* @__PURE__ */ jsx16(Field, { label: "Repo", children: e.app.repo }),
+    badge > 0 ? /* @__PURE__ */ jsx16(Field, { label: "Waiting", children: /* @__PURE__ */ jsx16(Text16, { color: theme.accent, wrap: "truncate-end", children: waitingText(e.app.id, badge) }) }) : null,
     /* @__PURE__ */ jsx16(Text16, { children: " " }),
     d?.state === "broken" ? /* @__PURE__ */ jsxs16(Text16, { color: theme.error, wrap: "wrap", children: [
       d.reason,
@@ -8108,6 +8672,8 @@ function Main({
   else body = /* @__PURE__ */ jsx19(SettingsTab, { ...props });
   const requests = store.friendsData().requests.length;
   const updates = store.appList().filter((e) => e.status.kind === "update").length + (store.updateAvailable ? 1 : 0);
+  const waiting = store.appList().reduce((n, e) => n + store.badge(e.app.id), 0);
+  const appsBadge = [waiting ? `${waiting > 99 ? "99+" : waiting}` : "", updates ? `\u2B06${updates}` : ""].filter(Boolean).join(" ");
   return /* @__PURE__ */ jsxs19(Box18, { flexDirection: "column", width, height, children: [
     /* @__PURE__ */ jsx19(
       Header,
@@ -8122,7 +8688,7 @@ function Main({
       }
     ),
     showBanner ? /* @__PURE__ */ jsx19(Banner, { width, compact: compact2, color: profileColor2, animate: store.isFocused && idle, mode: store.settings.animations }) : null,
-    /* @__PURE__ */ jsx19(Tabs, { active: tab, width, badges: { ...requests ? { friends: `${requests}` } : {}, ...updates ? { apps: `\u2B06${updates}` } : {} } }),
+    /* @__PURE__ */ jsx19(Tabs, { active: tab, width, badges: { ...requests ? { friends: `${requests}` } : {}, ...appsBadge ? { apps: appsBadge } : {} } }),
     body
   ] });
 }
