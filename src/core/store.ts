@@ -5,7 +5,9 @@ import { isSuiteApp, SUITE, type SuiteAppName } from 'termcore/app/suite';
 import { Toasts, type NoteKind, type Toast } from 'termcore/app/toasts';
 import { npmGlobalRoot } from 'termcore/app/update';
 import { displayName, type ContactOf } from 'termcore/friends/book';
+import { deliver, type DeliveryResult } from 'termcore/friends/courier';
 import { appendLog, FriendNet, type FriendEvent } from 'termcore/friends/net';
+import { badgeOf, noticeLine } from 'termcore/friends/notices';
 import { cleanStatusMsg, normalizeColor, type Profile, type Status } from 'termcore/friends/profile';
 import { reconcile, relStateFor, type ContactState, type RelState } from 'termcore/friends/state';
 import type { DiscoveredPeer, DiscoveryOptions } from 'termcore/net/discovery';
@@ -20,7 +22,6 @@ import { appUpdater, installApp, uninstallApp, updateApp, type OpResult } from '
 import { runningApps } from '../apps/running.js';
 import { Seen } from '../apps/seen.js';
 import { decryptBackup, exportBackup, restoreBackup, type BackupSummary } from './backup.js';
-import { deliver, type DeliveryResult } from './courier.js';
 import type { Paths } from './paths.js';
 import { compareVersions, requestRestart, self } from './update.js';
 import { REPO, VERSION } from './version.js';
@@ -173,8 +174,7 @@ export class HubStore {
   readonly apps = new Map<string, AppEntry>();
   self: SelfEntry;
   task: Task | null = null;
-  /** an app is open in this terminal right now (termhub is in the background) */
-  childRunning = false;
+  private child = false;
   /** the app to open next (the UI quits Ink, cli.tsx runs it and comes back) */
   launch: LaunchRequest | null = null;
 
@@ -221,10 +221,40 @@ export class HubStore {
         // which apps we have open: friends who connect to our termhub see it right away
         presenceExtra: () => ({ apps: runningPorts(this.paths.hub.runDir) }),
         settings: (s) => this.applySettings(s),
+        // an app opened from termhub is in front, not termhub (it shows notices then)
+        front: () => this.net.isFocused && !this.child,
+        // friends online anywhere: my apps can invite them or send them files through notices
+        seen: () => {
+          const out: Record<string, string[]> = {};
+          for (const c of this.contacts.all()) {
+            if (c.state !== 'accepted') continue;
+            const apps = this.appsOf(c.id);
+            if (apps.length) out[c.id] = apps;
+          }
+          return out;
+        },
       },
     });
     this.applySettings(this.hub.settings.get());
     setPersonColors((id) => this.contacts.get(id)?.color);
+    // the badges on the apps
+    this.hub.inbox.on('change', () => this.changed());
+  }
+
+  /** An app is open in this terminal right now (termhub is in the background). */
+  get childRunning(): boolean {
+    return this.child;
+  }
+
+  set childRunning(on: boolean) {
+    this.child = on;
+    this.net.refreshRun();
+  }
+
+  /** What an app has waiting for you: unread messages, invites, files – termhub's badge. */
+  badge(id: string): number {
+    if (!isSuiteApp(id)) return 0;
+    return badgeOf(this.hub.inbox.get(), id, this.apps.get(id)?.running ?? false);
   }
 
   static createProfile(paths: Paths, name: string, color?: string): string {
@@ -431,6 +461,8 @@ export class HubStore {
         return this.showToast(`${e.who} withdrew their friend request`);
       case 'requestSent':
         return this.showToast(`Friend request sent to ${e.who} – waiting for them to accept`);
+      case 'notice':
+        return this.showToast(noticeLine(e.notice));
       case 'unreachable':
       case 'linked':
         return;

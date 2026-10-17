@@ -102,6 +102,22 @@ Each app shows `○ not installed`, `✓ 2.1.0` or `⬆ 2.1.0 → 2.2.0`, `● r
 last opened termhub. Installs and updates show their progress and npm's output in the panel; if something goes
 wrong, the panel says what to do about it.
 
+A **badge** on the right of an app counts what's waiting for you there – unread termchat messages, keyrace
+invites, termdrop offers – and the tab says `Apps 3` for all of them together. The panel says what it is
+(`3 unread messages`).
+
+### Notifications across apps
+
+Whatever you have open – termhub, termdrop, termchat … – you hear about the others: a friend writes you in
+termchat while you only have termdrop open, and termdrop shows `termchat · Alice: hi` at the bottom (a desktop
+banner if none of your apps is in front). termhub counts it on termchat's badge, and when you open termchat the
+message is there. The same for keyrace invites and termdrop offers: friends who have only another app open show
+up as `◌ in termhub` and can still be invited or sent files – they're told where they are, and the invite or
+the offer follows once they open keyrace or termdrop.
+
+It works through any app you both have open (termhub runs in the background while you use the apps it opened,
+so usually through termhub), and needs version 2.2 of the apps (termhub 1.1) on both sides.
+
 ### Profile
 
 Name, profile color (the palette as color fields with a live preview of your name, `c` for your own `#rrggbb`,
@@ -150,8 +166,9 @@ All apps of the suite share one folder (another one: `--home <dir>` or `$TERMHUB
 | `identity.json`, `profile.json` | your key, name, color, status |
 | `friends.json`, `peers.json` | friends and requests, people you know |
 | `settings.json` | accent, animations, notifications |
+| `inbox.json`, `outbox.json` | notices across apps (a message for termchat while it was closed …) and what each app has waiting |
 | `links.json`, `migration.json`, `legacy/` | old IDs from before the shared folder, and copies of the old files |
-| `run/` | which apps are open right now (and on which port) |
+| `run/` | which apps are open right now (on which port, in front or not, which friends they see) |
 | `hub/` | termhub's own: the cached app catalog, the versions it saw last time (`new in`), its log, lock and socket |
 | `app/` | termhub itself, if it was updated without write access to npm's folder |
 

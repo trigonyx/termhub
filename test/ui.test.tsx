@@ -137,6 +137,32 @@ describe('termhub screens', () => {
     r.unmount();
   });
 
+  it('Apps: badges count what each app has waiting – messages, invites, files', async () => {
+    const s = stores.make(profile('Ada'));
+    const until = Date.now() + 60_000;
+    s.hub.inbox.update((box) => {
+      box.waiting = { termchat: { n: 2 }, termdrop: { n: 5, live: true } };
+      box.notices = [
+        { id: 'm1', app: 'termchat', kind: 'msg', title: 'Bob', body: 'hi', ts: 1, until, from: BOB },
+        { id: 'r1', app: 'keyrace', kind: 'invite', title: 'Bob', body: 'invites you to a race', ts: 2, until, from: BOB },
+        { id: 'n1', app: 'termdrop', kind: 'offer', title: 'Bob', body: 'note', ts: 3, until, from: BOB, local: true },
+      ];
+    });
+    expect(s.badge('termchat')).toBe(3);
+    expect(s.badge('keyrace')).toBe(1);
+    // termdrop's count only means something while it runs; a local note is never counted
+    expect(s.badge('termdrop')).toBe(0);
+    s.entry('termdrop')!.running = true;
+    expect(s.badge('termdrop')).toBe(5);
+    const r = main(s, 'apps');
+    await tick();
+    const f = frame(r);
+    expect(f).toContain('Apps 9');
+    expect(f).toMatch(/termchat .* 3   │/);
+    expect(f).toContain('3 unread messages');
+    r.unmount();
+  });
+
   it('opening an app that runs elsewhere is refused with a hint', async () => {
     const s = stores.make(profile('Ada'));
     const td = s.entry('termchat')!;

@@ -338,6 +338,8 @@ export function Main({
 
   const requests = store.friendsData().requests.length;
   const updates = store.appList().filter((e) => e.status.kind === 'update').length + (store.updateAvailable ? 1 : 0);
+  const waiting = store.appList().reduce((n, e) => n + store.badge(e.app.id), 0);
+  const appsBadge = [waiting ? `${waiting > 99 ? '99+' : waiting}` : '', updates ? `⬆${updates}` : ''].filter(Boolean).join(' ');
   return (
     <Box flexDirection="column" width={width} height={height}>
       <Header
@@ -350,7 +352,7 @@ export function Main({
         updateAvailable={store.updateAvailable}
       />
       {showBanner ? <Banner width={width} compact={compact} color={profileColor} animate={store.isFocused && idle} mode={store.settings.animations} /> : null}
-      <Tabs active={tab} width={width} badges={{ ...(requests ? { friends: `${requests}` } : {}), ...(updates ? { apps: `⬆${updates}` } : {}) }} />
+      <Tabs active={tab} width={width} badges={{ ...(requests ? { friends: `${requests}` } : {}), ...(appsBadge ? { apps: appsBadge } : {}) }} />
       {body}
     </Box>
   );

@@ -26,6 +26,12 @@ interface Props {
   bottomRows: number;
 }
 
+/** What the badge counts, in words: "2 unread messages", "1 invite". */
+export function waitingText(id: string, n: number): string {
+  const [one, many] = id === 'termchat' ? ['unread message', 'unread messages'] : id === 'keyrace' ? ['race invite', 'race invites'] : id === 'termdrop' ? ['file offer', 'file offers'] : ['new thing', 'new things'];
+  return `${n} ${n === 1 ? one : many}`;
+}
+
 const statusColor = (s: AppStatus) => (s.kind === 'update' ? theme.accent : s.kind === 'current' ? theme.success : s.kind === 'broken' ? theme.error : theme.faint);
 
 export function appsHints(row: Row | undefined, store: HubStore): string[] {
@@ -189,6 +195,7 @@ function AppRow({ row, store, selected, width, gap }: { row: Row; store: HubStor
     );
   }
   const e = row.e;
+  const badge = store.badge(e.app.id);
   const checking = e.detected === undefined;
   const label = checking ? 'checking …' : statusLabel(e.status);
   const statusWidth = Math.min(22, Math.max(12, label.length + 1));
@@ -214,6 +221,13 @@ function AppRow({ row, store, selected, width, gap }: { row: Row; store: HubStor
           {e.newIn ? <Text color={theme.accent}>new in {e.newIn.to} </Text> : null}
           {width >= 70 ? <Text color={theme.dim}>{e.app.description}</Text> : null}
         </Text>
+      </Box>
+      <Box width={5} flexShrink={0} justifyContent="flex-end">
+        {badge > 0 ? (
+          <Text backgroundColor={theme.accent} color={theme.onAccent} bold>
+            {` ${badge > 99 ? '99+' : badge} `}
+          </Text>
+        ) : null}
       </Box>
     </Box>
   );
@@ -248,6 +262,7 @@ function Detail({ store, row, width, height }: { store: HubStore; row: Row | und
   const main = d?.state === 'installed' ? d.main : null;
   const where = main ? (main.kind === 'global' ? "npm's global folder" : main.kind === 'local' ? tildify(main.where.replace(/[/\\]node_modules[/\\][^/\\]+$/, '')) : tildify(main.where)) : '–';
   const node = e.app.node ? `Node.js ${e.app.node}+` : 'any';
+  const badge = store.badge(e.app.id);
   return (
     <Card title={`${e.app.icon ? `${e.app.icon} ` : ''}${e.app.name}`} width={width} height={height}>
       <Text color={theme.dim} wrap="wrap">
@@ -259,6 +274,13 @@ function Detail({ store, row, width, height }: { store: HubStore; row: Row | und
       <Field label="Where">{where}</Field>
       <Field label="Needs">{node}</Field>
       <Field label="Repo">{e.app.repo}</Field>
+      {badge > 0 ? (
+        <Field label="Waiting">
+          <Text color={theme.accent} wrap="truncate-end">
+            {waitingText(e.app.id, badge)}
+          </Text>
+        </Field>
+      ) : null}
       <Text> </Text>
       {d?.state === 'broken' ? (
         <Text color={theme.error} wrap="wrap">
